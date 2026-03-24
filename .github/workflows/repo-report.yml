@@ -1,1 +1,171 @@
+name: Repo Analysis Report
 
+on:
+  workflow_dispatch:
+    inputs:
+      report_path:
+        description: "Where to write the report (relative to repo root)"
+        required: true
+        default: "reports/repo-report.md"
+      extra_exclude_globs:
+        description: "Extra exclude globs (comma-separated). Example: dist/**,build/**,**/*.min.js"
+        required: false
+        default: "dist/**,build/**,coverage/**,node_modules/**,.venv/**,.git/**"
+      max_total_lines:
+        description: "Optional guardrail. If total lines exceed this, fail the job. 0 disables."
+        required: true
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Tokei gives solid language breakdown and line statistics.
+      # We'll use its JSON output, then post-process.
+      - name: Install tokei
+        run: |
+          curl -sSL https://github.com/XAMPPRocky/tokei/releases/latest/download/tokei-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz
+          sudo mv tokei /usr/local/bin/tokei
+          tokei --version
+
+      - name: Analyze and create report
+        env:
+          REPORT_PATH: ${{ inputs.report_path }}
+          EXTRA_EXCLUDE_GLOBS: ${{ inputs.extra_exclude_globs }}
+          MAX_TOTAL_LINES: ${{ inputs.max_total_lines }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$REPORT_PATH")"
+
+          # Exclusions:
+          # - Always exclude the report output itself (so reruns don't count it)
+          # - Exclude common generated/vendor dirs
+          # - Add user-provided extra excludes
+          #
+          # NOTE: tokei's --exclude accepts patterns and can be repeated.
+          EXCLUDES=()
+          EXCLUDES+=("$REPORT_PATH")
+          EXCLUDES+=("reports/**")
+
+          # split comma-separated globs
+          IFS=',' read -r -a EXTRA <<< "$EXTRA_EXCLUDE_GLOBS"
+          for g in "${EXTRA[@]}"; do
+            g_trimmed="$(echo "$g" | xargs)"
+            if [ -n "$g_trimmed" ]; then
+              EXCLUDES+=("$g_trimmed")
+            fi
+          done
+
+          # Build tokei command
+          TOKEI_ARGS=(--output json)
+          for e in "${EXCLUDES[@]}"; do
+            TOKEI_ARGS+=(--exclude "$e")
+          done
+
+          # Run analysis
+          tokei "${TOKEI_ARGS[@]}" . > tokei.json
+
+          # Compute a few extra repo stats (file count, total bytes, largest files).
+          # Exclude the same patterns using find filters in a pragmatic way:
+          # - we exclude the report path and the reports dir
+          # - we exclude .git always
+          #
+          # If you need strict glob parity with tokei, you can swap this for a small Python matcher.
+          FILES_LIST="$(mktemp)"
+          find . -type f \
+            -not -path "./.git/*" \
+            -not -path "./${REPORT_PATH#./}" \
+            -not -path "./reports/*" \
+            > "$FILES_LIST"
+
+          FILE_COUNT="$(wc -l < "$FILES_LIST" | tr -d ' ')"
+          TOTAL_BYTES="$(awk '{print}' "$FILES_LIST" | xargs -I{} stat -c%s "{}" 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+
+          # Largest 15 files
+          LARGEST_FILES="$(awk '{print}' "$FILES_LIST" | xargs -I{} stat -c"%s %n" "{}" 2>/dev/null | sort -nr | head -n 15 || true)"
+
+          # Extract total line counts from tokei JSON via python (available on ubuntu-latest)
+          python3 - << 'PY'
+          import json
+
+          with open("tokei.json","r",encoding="utf-8") as f:
+            data = json.load(f)
+
+          # tokei JSON structure has "Total" and per-language entries
+          total = data.get("Total", {})
+          code = int(total.get("code", 0))
+          comments = int(total.get("comments", 0))
+          blanks = int(total.get("blanks", 0))
+          lines = int(total.get("lines", code + comments + blanks))
+
+          with open("totals.env","w",encoding="utf-8") as f:
+            f.write(f"TOTAL_LINES={lines}\n")
+            f.write(f"TOTAL_CODE={code}\n")
+            f.write(f"TOTAL_COMMENTS={comments}\n")
+            f.write(f"TOTAL_BLANKS={blanks}\n")
+          PY
+
+          # Load totals
+          set -a
+          . ./totals.env
+          set +a
+
+          # Optional guardrail
+          if [ "${MAX_TOTAL_LINES}" != "0" ] && [ "${TOTAL_LINES}" -gt "${MAX_TOTAL_LINES}" ]; then
+            echo "Total lines (${TOTAL_LINES}) exceeded max_total_lines (${MAX_TOTAL_LINES})." >&2
+            exit 1
+          fi
+
+          # Generate markdown report
+          {
+            echo "# Repo Analysis Report"
+            echo
+            echo "- Generated: $(date -u +"%Y-%m-%d %H:%M:%SZ")"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Excluded from analysis: \`${REPORT_PATH}\`, \`reports/**\` plus extra excludes"
+            echo
+            echo "## High-level totals"
+            echo
+            echo "- Files counted (approx): ${FILE_COUNT}"
+            echo "- Total bytes (approx): ${TOTAL_BYTES}"
+            echo "- Total lines: ${TOTAL_LINES}"
+            echo "- Code lines: ${TOTAL_CODE}"
+            echo "- Comment lines: ${TOTAL_COMMENTS}"
+            echo "- Blank lines: ${TOTAL_BLANKS}"
+            echo
+            echo "## Language breakdown (tokei)"
+            echo
+            echo "Raw JSON saved as \`tokei.json\` (uploaded as artifact)."
+            echo
+            echo "## Largest files (top 15)"
+            echo
+            echo '```'
+            echo "${LARGEST_FILES}"
+            echo '```'
+          } > "$REPORT_PATH"
+
+      - name: Upload report + raw data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-analysis-report
+          path: |
+            ${{ inputs.report_path }}
+            tokei.json
+
+      # Optional: commit report back to the repo (disabled by default).
+      # Enable only if you actually want reports in git history.
+      # - name: Commit report
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add "${{ inputs.report_path }}"
+      #     git commit -m "Update repo analysis report" || exit 0
+      #     git push
